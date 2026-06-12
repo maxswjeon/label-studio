@@ -1,0 +1,198 @@
+# Label Studio (OSS 1.23.0) — web + rqworker + redis.
+#
+# Storage sync is enqueued to Redis-backed RQ (enabled via patches/redis_enable.py,
+# since OSS hardcodes REDIS_ENABLED=False) and processed by the `worker` container,
+# NOT by a uWSGI web worker. This is what fixes the "last ping time is too old"
+# sync failures: the sync job runs in a worker process uWSGI never recycles.
+#
+# The web (`labelstudio`) and `worker` containers share one image + env + patch
+# mounts via the `ls-common` anchor below; they differ only in command/ports.
+
+x-ls-common: &ls-common
+  image: heartexlabs/label-studio:1.23.0
+  restart: unless-stopped
+  volumes:
+    - ./data:/label-studio/data
+    # --- Tier-1 community RBAC hardening (deny destructive/onboarding API actions for @ext annotators) ---
+    # Mounted into BOTH entrypoint dirs so the hook runs under either command:
+    #   app/        -> CMD "label-studio-uwsgi" (web)
+    #   app-docker/ -> any other CMD, e.g. the worker's `manage.py rqworker`
+    - ./patches/rbac_tier1.py:/label-studio/label_studio/rbac_tier1.py:ro
+    - ./patches/40-rbac-tier1.sh:/label-studio/deploy/docker-entrypoint.d/app/40-rbac-tier1.sh:ro
+    - ./patches/40-rbac-tier1.sh:/label-studio/deploy/docker-entrypoint.d/app-docker/40-rbac-tier1.sh:ro
+    # --- Persistent Postgres connections (CONN_MAX_AGE) to drop ~55ms/request reconnect to RDS ---
+    - ./patches/db_perf.py:/label-studio/label_studio/db_perf.py:ro
+    - ./patches/41-db-perf.sh:/label-studio/deploy/docker-entrypoint.d/app/41-db-perf.sh:ro
+    - ./patches/41-db-perf.sh:/label-studio/deploy/docker-entrypoint.d/app-docker/41-db-perf.sh:ro
+    # --- Enable Redis-backed RQ (OSS hardcodes REDIS_ENABLED=False; this flips it
+    #     and repoints RQ_QUEUES at the `redis` service). No-op unless REDIS_HOST set. ---
+    - ./patches/redis_enable.py:/label-studio/label_studio/redis_enable.py:ro
+    - ./patches/42-redis.sh:/label-studio/deploy/docker-entrypoint.d/app/42-redis.sh:ro
+    - ./patches/42-redis.sh:/label-studio/deploy/docker-entrypoint.d/app-docker/42-redis.sh:ro
+    # --- Null-job-id guard for storage health checks (prevents Job.fetch(None) ->
+    #     500 -> storages vanish from UI; only reachable once Redis is enabled). ---
+    - ./patches/storage_health_patch.py:/label-studio/label_studio/storage_health_patch.py:ro
+    - ./patches/43-storage-health.sh:/label-studio/deploy/docker-entrypoint.d/app/43-storage-health.sh:ro
+    - ./patches/43-storage-health.sh:/label-studio/deploy/docker-entrypoint.d/app-docker/43-storage-health.sh:ro
+    # --- Server-Timing header (origin app/DB time) so network/proxy latency can be
+    #     separated from origin processing in browser devtools. ---
+    - ./patches/server_timing.py:/label-studio/label_studio/server_timing.py:ro
+    - ./patches/44-server-timing.sh:/label-studio/deploy/docker-entrypoint.d/app/44-server-timing.sh:ro
+    - ./patches/44-server-timing.sh:/label-studio/deploy/docker-entrypoint.d/app-docker/44-server-timing.sh:ro
+  environment:
+    # --- Performance (uWSGI vars are read only by the web container; harmless on the worker) ---
+    # uWSGI worker processes (16 cores / 32 GB free on host).
+    - UWSGI_PROCESSES=8
+    # Per-worker RSS reload ceiling, MB (default 1024). Less critical now that the
+    # heavy storage sync runs in the rqworker, not a uWSGI worker — but kept raised
+    # so an inline (redis-down) fallback sync still has headroom.
+    - UWSGI_WORKER_RELOAD_ON_RSS=3072
+    # Max worker lifetime, seconds (default 1200 = 20 min).
+    - UWSGI_WORKER_MAX_LIFETIME=7200
+    # Per-request harakiri, seconds (default 91) — for the heavy sync-trigger call.
+    - UWSGI_WORKER_HARAKIRI=300
+    # Persistent DB connection lifetime (seconds) read by patches/db_perf.py.
+    - LS_CONN_MAX_AGE=600
+    - LS_CONN_HEALTH_CHECKS=true
+    # Skip the per-request pypi.org "latest version" lookup.
+    - LATEST_VERSION_CHECK=false
+
+    # --- Redis / RQ (read by patches/redis_enable.py) ---
+    # Setting REDIS_HOST is what turns Redis on; unset it to fall back to in-thread sync.
+    - REDIS_HOST=redis
+    - REDIS_PORT=6379
+    - REDIS_DB=0
+    # Long-running job timeout (storage sync uses this). Default 36000s (10h).
+    - RQ_LONG_JOB_TIMEOUT=36000
+
+    # --- PostgreSQL (AWS RDS) ---
+    - DJANGO_DB=default
+    - POSTGRE_NAME=${DATABASE_NAME}
+    - POSTGRE_USER=${DATABASE_USER}
+    - POSTGRE_PASSWORD=${DATABASE_PASSWORD}
+    - POSTGRE_PORT=5432
+    - POSTGRE_HOST=${DATABASE_HOST}
+
+    # --- S3 media storage backend (uploads, avatars, exports) ---
+    - STORAGE_TYPE=s3
+    - STORAGE_AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    - STORAGE_AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - STORAGE_AWS_BUCKET_NAME=${S3_BUCKET_NAME}
+    - STORAGE_AWS_REGION_NAME=${AWS_REGION}
+    - STORAGE_AWS_FOLDER=${S3_FOLDER:-}
+
+    # --- AWS creds for per-project Cloud Storage sync (boto3 default chain) ---
+    - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - AWS_DEFAULT_REGION=${AWS_REGION}
+
+    # --- Public URL & initial admin (optional) ---
+    - LABEL_STUDIO_HOST=${LABEL_STUDIO_HOST:-}
+    - LABEL_STUDIO_USERNAME=${LABEL_STUDIO_USERNAME:-}
+    - LABEL_STUDIO_PASSWORD=${LABEL_STUDIO_PASSWORD:-}
+
+    # --- Security ---
+    - SSRF_PROTECTION_ENABLED=true
+    - COLLECT_ANALYTICS=false
+    - USE_ENFORCE_CSRF_CHECKS=true
+    - CSRF_TRUSTED_ORIGINS=${LABEL_STUDIO_HOST}
+
+    # --- Misc. Settings ---
+    - LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK=true
+
+    # --- Tier-1 RBAC: email suffix that marks a restricted external annotator ---
+    - RBAC_RESTRICTED_EMAIL_SUFFIX=${RBAC_RESTRICTED_EMAIL_SUFFIX:-@ext.example.com}
+  logging:
+    driver: local
+
+services:
+  labelstudio:
+    <<: *ls-common
+    container_name: label-studio
+    # --- Production uWSGI server (multi-worker). Its app/ entrypoint scripts run
+    #     DB migrations; the worker (app-docker/) does NOT, so no migration race. ---
+    command: label-studio-uwsgi
+    ports:
+      # uwsgi.ini serves HTTP on :8000.
+      - "1800:8000"
+    depends_on:
+      redis:
+        condition: service_started
+      # Wait for the local DB to pass its healthcheck before the app/migrations run.
+      postgres:
+        condition: service_healthy
+
+  # Dedicated RQ worker: processes the `low` queue (storage sync lands there) plus
+  # the others, in a process uWSGI never recycles. Scale for parallel syncs with:
+  #   docker compose up -d --scale worker=3   (remove container_name first to scale)
+  worker:
+    <<: *ls-common
+    # No container_name: lets `docker compose up -d --scale worker=N` run multiple
+    # worker replicas (Compose names them label-studio-worker-1, -2, ...). A fixed
+    # container_name would collide and block scaling.
+    # First arg is not "label-studio-uwsgi"/"nginx"/"-migrate", so the entrypoint
+    # runs the app-docker/ hooks (incl. our patches) then execs this command.
+    command: ["python3", "/label-studio/label_studio/manage.py", "rqworker", "critical", "high", "default", "low", "--with-scheduler"]
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      labelstudio:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    container_name: label-studio-redis
+    restart: unless-stopped
+    # Job queue, not a datastore: no persistence, and noeviction so queued jobs are
+    # never dropped under memory pressure (they'd be silently lost otherwise).
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    logging:
+      driver: local
+
+  # Local PostgreSQL — replaces AWS RDS to kill cross-network per-query latency (the main
+  # remaining delay). Co-located on the compose bridge => loopback round-trips.
+  #   IMAGE: postgres:17 is Debian *bookworm* (glibc), NOT -alpine (musl). RDS 17.7 is glibc,
+  #   so its text B-tree / pg_trgm GIN indexes encode glibc collation ordering; a musl server
+  #   would collate differently and risk wrong ordering / index corruption on restore.
+  #   Cluster is initdb'd UTF8 / en_US.UTF-8 to match RDS exactly.
+  # Creds are intentionally decoupled from the app's DATABASE_* (own user `labelstudio` +
+  # LOCAL_DB_PASSWORD) so this can come up live while the app is still on RDS; the app only
+  # flips to local at cutover.
+  postgres:
+    image: postgres:17
+    container_name: label-studio-postgres
+    restart: unless-stopped
+    shm_size: 256mb
+    environment:
+      - POSTGRES_DB=label-studio
+      - POSTGRES_USER=labelstudio
+      - POSTGRES_PASSWORD=${LOCAL_DB_PASSWORD}
+      # Match RDS exactly: UTF8 / en_US.UTF-8 (the bookworm image ships this locale).
+      - LANG=en_US.UTF-8
+      - POSTGRES_INITDB_ARGS=--data-checksums --encoding=UTF8 --locale=en_US.UTF-8
+    # Tuning for a 16-core / 32 GB host. max_connections=200 covers 8 uWSGI workers holding
+    # persistent (CONN_MAX_AGE) connections + the rqworker(s) + headroom.
+    command:
+      - postgres
+      - "-c"
+      - "shared_buffers=2GB"
+      - "-c"
+      - "effective_cache_size=6GB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "max_connections=200"
+    volumes:
+      # Bind mount (not a named volume) so the data is visible on the host for tar/rsync backup.
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging:
+      driver: local

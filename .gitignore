@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Secrets — NEVER commit. Real values live here; publish .env.example instead.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+*credentials*
+*secret*
+
+# ---------------------------------------------------------------------------
+# Database — local Postgres cluster + logical dumps. Contain ALL user data
+# (emails, password hashes, annotations, tokens). Huge and sensitive.
+# ---------------------------------------------------------------------------
+pgdata/
+backups/
+*.dump
+*.sql
+*.sql.gz
+
+# ---------------------------------------------------------------------------
+# Runtime data — uploads, media, project exports. Real labeled data.
+# ---------------------------------------------------------------------------
+data/
+!data/.gitkeep
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+*.log
+.DS_Store
